@@ -47,3 +47,12 @@ async def process_endpoint(file: UploadFile = File(...)):
     except Exception as e:
         import traceback
         return JSONResponse(status_code=500, content={"error": traceback.format_exc()})
+
+if __name__ == "__main__":
+    import uvicorn
+
+    port = int(os.getenv("PORT", 80))
+    logger.info(f"Starting vLLM server on port {port}")
+
+    # Start the server
+    uvicorn.run(app, host="0.0.0.0", port=port)
