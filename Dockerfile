@@ -1,29 +1,48 @@
-# FINAL WORKING DOCKERFILE — RunPod Load Balancer + Auto-download SAM model
-FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
+# -------------------------------------------------------------
+# RunPod Serverless GPU Base Image (CUDA 12.1, Ubuntu 22.04)
+# -------------------------------------------------------------
+FROM nvidia/cuda:12.1.0-base-ubuntu22.04
 
 WORKDIR /app
 
-# Install system dependencies + wget for downloading model
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgl1 libglib2.0-0 ffmpeg git wget && \
+# -------------------------------------------------------------
+# System Dependencies (minimal + stable)
+# -------------------------------------------------------------
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        python3-pip \
+        libgl1 \
+        libglib2.0-0 \
+        wget && \
     rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
+# -------------------------------------------------------------
+# Python Dependencies
+# Torch 2.1.2 + TorchVision 0.16.1 are the correct CUDA 12.1 wheels
+# -------------------------------------------------------------
 COPY requirements.txt .
-RUN pip install --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+RUN pip3 install --no-cache-dir --upgrade pip && \
+    pip3 install --no-cache-dir -r requirements.txt
 
-# Copy your code and small model
+# -------------------------------------------------------------
+# Application Code
+# -------------------------------------------------------------
 COPY app.py .
 COPY remove_sam_lama_fast.py .
 COPY best.pt .
 
-# Download official SAM ViT-B checkpoint (~300 MB) — this runs every build (15 seconds)
+# Download SAM ViT-B checkpoint (fast, stable, GPU-compatible)
 RUN wget -O sam_vit_b_01ec64.pth \
     https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth
 
-# RunPod Load Balancer expects port 80
-EXPOSE 80
+# -------------------------------------------------------------
+# RunPod Serverless: port is dynamic via $PORT
+# DO NOT hardcode port 80
+# -------------------------------------------------------------
+ENV PYTHONUNBUFFERED=1
+ENV PORT=8000
 
-# Start Uvicorn on port 80 — this is the key fix
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "80", "--workers", "1"]
+# -------------------------------------------------------------
+# Start FastAPI via uvicorn on the correct port
+# -------------------------------------------------------------
+CMD ["python3", "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
