@@ -1,58 +1,61 @@
+import io
+import base64
+from fastapi import FastAPI, UploadFile, File
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from PIL import Image
+
 import os
-import tempfile
-from fastapi import FastAPI, File, UploadFile
-from fastapi.responses import Response, JSONResponse
+import uvicorn
+from remove_sam_lama_fast import process_image   # your pipeline
 
-app = FastAPI()
 
-# --- DO NOT LOAD MODELS HERE ---
-# We will load them lazily on first request only
+app = FastAPI(title="Sticker Remover API")
 
+# Allow all origins (optional)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# -----------------------------
+# Health Endpoint (RunPod needs this!)
+# -----------------------------
 @app.get("/ping")
 def ping():
     return {"status": "ok"}
 
-@app.get("/")
-def home():
-    return {"message": "Sticker Remover API ready"}
 
+# -----------------------------
+# POST /process  (image upload)
+# -----------------------------
 @app.post("/process")
-async def process_endpoint(file: UploadFile = File(...)):
-    # Load models only when first request comes in
-    global process_image
-    try:
-        from remove_sam_lama_fast import process_image
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": f"Model load failed: {str(e)}"})
+async def process_route(file: UploadFile = File(...)):
+    """
+    Accepts an uploaded image (jpg/png/webp).
+    Returns base64 cleaned result.
+    """
+    img_bytes = await file.read()
 
-    try:
-        suffix = os.path.splitext(file.filename)[1] or ".webp"
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_in:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".webp") as tmp_out:
-                contents = await file.read()
-                tmp_in.write(contents)
-                in_path = tmp_in.name
-                out_path = tmp_out.name
+    # Run your YOLO -> SAM -> LaMa pipeline
+    output_bytes = process_image(img_bytes)
 
-        process_image(in_path, out_path, slno=1)
+    # Convert to base64
+    output_base64 = base64.b64encode(output_bytes).decode("utf-8")
 
-        with open(out_path, "rb") as f:
-            result = f.read()
+    return JSONResponse({
+        "status": "success",
+        "result_base64": output_base64
+    })
 
-        os.unlink(in_path)
-        os.unlink(out_path)
 
-        return Response(content=result, media_type="image/webp")
-
-    except Exception as e:
-        import traceback
-        return JSONResponse(status_code=500, content={"error": traceback.format_exc()})
-
+# -----------------------------
+# PORT-AWARE STARTER (for RunPod & Modal)
+# -----------------------------
 if __name__ == "__main__":
-    import uvicorn
-
-    port = int(os.getenv("PORT", 80))
-    logger.info(f"Starting vLLM server on port {port}")
-
-    # Start the server
+    port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
