@@ -52,7 +52,6 @@ if __name__ == "__main__":
     import uvicorn
 
     port = int(os.getenv("PORT", 80))
-    logger.info(f"Starting vLLM server on port {port}")
 
     # Start the server
     uvicorn.run(app, host="0.0.0.0", port=port)
