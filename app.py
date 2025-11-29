@@ -1,44 +1,13 @@
 import os
 import tempfile
-import threading
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import Response, JSONResponse
 
 app = FastAPI()
 
-
-# ============================================================
-# 🔥 BACKGROUND PRELOAD ON STARTUP — NO COLD STARTS EVER AGAIN
-# ============================================================
-
-def preload_models():
-    try:
-        print("🔥 Preloading models on startup...")
-        import remove_sam_lama_fast as m
-
-        # Touch objects to ensure initialization
-        _ = m.yolo
-        _ = m.sam
-        _ = m.lama_model
-
-        print("✅ Models preloaded successfully!")
-    except Exception as e:
-        print("❌ Model preload failed:", str(e))
-
-
-@app.on_event("startup")
-def startup_event():
-    threading.Thread(target=preload_models, daemon=True).start()
-
-
-# ============================================================
-# Endpoints
-# ============================================================
-
 @app.get("/ping")
 def ping():
     return {"status": "ok"}
-
 
 @app.get("/")
 def home():
@@ -50,13 +19,17 @@ def home():
 # ============================================================
 @app.post("/process")
 async def process_endpoint(file: UploadFile = File(...)):
-    # Lazy import (already preloaded)
     try:
+        # Lazy import (loads module + models the first time)
         from remove_sam_lama_fast import process_image
+
     except Exception as e:
         return JSONResponse(
             status_code=500,
-            content={"status": "error", "message": f"Model load failed: {str(e)}"},
+            content={
+                "status": "error",
+                "message": f"Model import failed: {str(e)}"
+            }
         )
 
     try:
@@ -69,11 +42,13 @@ async def process_endpoint(file: UploadFile = File(...)):
             in_path = tmp_in.name
             out_path = tmp_out.name
 
-        # ROI processing
+        # Process ROI
         process_image(in_path, out_path, slno=1)
 
+        # Read output image
         result = open(out_path, "rb").read()
 
+        # Cleanup
         os.unlink(in_path)
         os.unlink(out_path)
 
@@ -85,11 +60,12 @@ async def process_endpoint(file: UploadFile = File(...)):
 
     except Exception:
         import traceback
+        # 100% guarantee clean JSON error
         return JSONResponse(
             status_code=500,
             content={
                 "status": "error",
-                "message": "Processing failed",
+                "message": "ROI processing failed",
                 "trace": traceback.format_exc()
             }
         )
@@ -100,13 +76,17 @@ async def process_endpoint(file: UploadFile = File(...)):
 # ============================================================
 @app.post("/process-full")
 async def process_full_endpoint(file: UploadFile = File(...)):
-    # Lazy import (already preloaded)
     try:
+        # Lazy import full variant
         from remove_sam_lama_fast import process_image_full
+
     except Exception as e:
         return JSONResponse(
             status_code=500,
-            content={"status": "error", "message": f"Model load failed (full): {str(e)}"},
+            content={
+                "status": "error",
+                "message": f"Model import failed (full): {str(e)}"
+            }
         )
 
     try:
@@ -119,11 +99,12 @@ async def process_full_endpoint(file: UploadFile = File(...)):
             in_path = tmp_in.name
             out_path = tmp_out.name
 
-        # FULL IMAGE PROCESSING
+        # Process full-image version
         process_image_full(in_path, out_path, slno=1)
 
         result = open(out_path, "rb").read()
 
+        # Cleanup
         os.unlink(in_path)
         os.unlink(out_path)
 
@@ -139,7 +120,7 @@ async def process_full_endpoint(file: UploadFile = File(...)):
             status_code=500,
             content={
                 "status": "error",
-                "message": "Full inpaint failed",
+                "message": "Full image processing failed",
                 "trace": traceback.format_exc()
             }
         )
