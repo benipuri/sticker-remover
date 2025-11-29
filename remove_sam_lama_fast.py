@@ -2,6 +2,57 @@
 # YOLO (box) -> SAM (precise mask, now on downscaled copy) -> upsample -> LaMa inpaint (combined mask + ROI crop)
 # pip install simple-lama-inpainting
 
+# remove_sam_lama_fast.py
+# YOLO (box) -> SAM (precise mask, now on downscaled copy) -> upsample -> LaMa inpaint (combined mask + ROI crop)
+
+import os
+import sys
+import shutil
+
+import cv2
+import numpy as np
+import torch
+
+from ultralytics import YOLO
+from segment_anything import sam_model_registry, SamPredictor
+from simple_lama_inpainting import SimpleLama
+
+# ================== CONFIG / CONSTANTS ==================
+
+# Device: GPU if available, otherwise CPU
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Paths to models inside the container
+# best.pt is copied to /app in your Dockerfile
+YOLO_MODEL_PATH = os.getenv("YOLO_MODEL_PATH", "/app/best.pt")
+
+# SAM checkpoint is downloaded to /app in your Dockerfile
+SAM_CHECKPOINT = os.getenv("SAM_CHECKPOINT", "/app/sam_vit_b_01ec64.pth")
+
+# YOLO inference settings
+IMGSZ = int(os.getenv("YOLO_IMGSZ", "1024"))      # image size for YOLO
+CONF  = float(os.getenv("YOLO_CONF", "0.30"))     # confidence threshold
+
+# SAM + mask post-processing
+SAM_MAX_SIDE = int(os.getenv("SAM_MAX_SIDE", "1024"))
+
+ERODE_PX   = int(os.getenv("ERODE_PX", "1"))
+DILATE_PX  = int(os.getenv("DILATE_PX", "3"))
+FEATHER_PX = int(os.getenv("FEATHER_PX", "7"))
+
+# Inpainting parameters
+TELEA_RADIUS = int(os.getenv("TELEA_RADIUS", "3"))
+NS_RADIUS    = int(os.getenv("NS_RADIUS", "3"))
+
+# ROI control
+MAX_ROI_PIXELS   = int(os.getenv("MAX_ROI_PIXELS", str(800 * 800)))  # ~800x800
+SMALL_MASK_AREA  = int(os.getenv("SMALL_MASK_AREA", "64"))
+ROI_PAD_PX       = int(os.getenv("ROI_PAD_PX", "10"))
+
+# Default inpaint method for the main pipeline
+INPAINT_METHOD = os.getenv("INPAINT_METHOD", "lama")
+
+# ================== MODELS WILL BE LOADED BELOW ==================
 # ========= Load models once at import time (perfect for serverless) =========
 print(f"Loading YOLO from {YOLO_MODEL_PATH}...")
 yolo = YOLO(YOLO_MODEL_PATH)
