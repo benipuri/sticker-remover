@@ -2,6 +2,32 @@
 # YOLO (box) -> SAM (precise mask, now on downscaled copy) -> upsample -> LaMa inpaint (combined mask + ROI crop)
 # pip install simple-lama-inpainting
 
+import os, sys, cv2, numpy as np, torch, shutil
+from ultralytics import YOLO
+from segment_anything import SamPredictor, sam_model_registry
+from simple_lama_inpainting import SimpleLama
+
+# ========= Config (serverless) =========
+YOLO_MODEL_PATH  = "/app/best.pt"               # resolves to /app/best.pt in your container
+SAM_CHECKPOINT   = "/app/sam_vit_b_01ec64.pth"  # resolves to /app/sam_vit_b_01ec64.pth
+
+CONF             = 0.03
+IMGSZ            = 896
+INPAINT_METHOD   = "lama"
+TELEA_RADIUS     = 2
+NS_RADIUS        = 2
+SMALL_MASK_AREA  = 1600
+MAX_ROI_PIXELS   = 1_500_000
+ROI_PAD_PX       = 25
+
+ERODE_PX         = 0
+DILATE_PX        = 2
+FEATHER_PX       = 3
+
+SAM_MAX_SIDE     = 1600
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
 # ========= Load models once at import time (perfect for serverless) =========
 print(f"Loading YOLO from {YOLO_MODEL_PATH}...")
 yolo = YOLO(YOLO_MODEL_PATH)
@@ -38,8 +64,6 @@ def _copy_to_notfound(src_path: str):
     We already return the original image in the two main cases above.
     This function exists only to prevent NameError.
     """
-    # Optionally you can add a log if you want
-    # print("No sticker found after SAM — returning original image")
     pass
 
 def _tight_feather(mask: np.ndarray) -> np.ndarray:
@@ -95,7 +119,7 @@ def lama_inpaint(img_bgr: np.ndarray, raw_mask: np.ndarray) -> np.ndarray:
     mask = (mask > 0).astype(np.uint8) * 255
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     with torch.inference_mode():
-        out = lama_model(img_rgb, mask)  # RGB numpy or PIL
+        out = lama_model(img_rgb, mask)
     if hasattr(out, "mode"):
         out = np.array(out)
     return cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
@@ -118,9 +142,7 @@ def smart_inpaint(img: np.ndarray, raw_mask: np.ndarray, method: str = "lama") -
             return telea_inpaint(img, mask)
     return ns_inpaint(img, raw_mask)
 
-# ======== NEW (from Gradio app): SAM on downscaled image, then upsample ========
 def _resize_for_sam(img_bgr: np.ndarray, max_side: int = SAM_MAX_SIDE):
-    """Return (img_rgb_small, scale_small_over_orig)."""
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     H, W = img_rgb.shape[:2]
     scale = min(max_side / max(H, W), 1.0)
@@ -137,28 +159,16 @@ def _upsample_mask_bool(mask_small: np.ndarray, orig_shape_hw: tuple[int,int]) -
     return (big > 0)
 
 def sam_prepare_image_once(img_bgr: np.ndarray):
-    """
-    Prepare SAM once per image: downscale copy, set_image() to cache embeddings.
-    Returns (sam_scale, orig_hw) where sam_scale = small/orig.
-    """
     small_rgb, sam_scale = _resize_for_sam(img_bgr, SAM_MAX_SIDE)
-    predictor.set_image(small_rgb)  # cache embeddings on small image
+    predictor.set_image(small_rgb)
     return sam_scale, img_bgr.shape[:2]
 
 def sam_mask_from_box_scaled(box_xyxy: list[float], sam_scale: float, orig_hw: tuple[int,int]) -> np.ndarray:
-    """
-    Predict mask with SAM using the already-set small image.
-    - Scale the original box to small coords, then predict with torch path.
-    - Upsample the resulting mask back to original HxW and return as uint8 (0/255).
-    """
-    # Scale the box down to the small-image coordinate space
-    b = np.array(box_xyxy, dtype=np.float32) * float(sam_scale)  # xyxy in small space
+    b = np.array(box_xyxy, dtype=np.float32) * float(sam_scale)
     H, W = orig_hw
     with torch.inference_mode():
-        # Build on the same device SAM is on
         dev = predictor.device
         b_t = torch.as_tensor(b, dtype=torch.float32, device=dev).unsqueeze(0)
-        # predictor.transform expects the image SAM has set; use torch variant
         b_trans = predictor.transform.apply_boxes_torch(b_t, (int(H * sam_scale), int(W * sam_scale)))
         try:
             masks_t, _, _ = predictor.predict_torch(
@@ -169,7 +179,6 @@ def sam_mask_from_box_scaled(box_xyxy: list[float], sam_scale: float, orig_hw: t
             )
             mask_small = masks_t[0, 0].to("cpu").numpy().astype(bool)
         except TypeError:
-            # Fallback to numpy path if older SAM
             b_np = np.array([b], dtype=np.float32)
             b_trans_np = predictor.transform.apply_boxes(b_np, (int(H * sam_scale), int(W * sam_scale)))
             masks, _, _ = predictor.predict(
@@ -180,7 +189,6 @@ def sam_mask_from_box_scaled(box_xyxy: list[float], sam_scale: float, orig_hw: t
             )
             mask_small = masks[0].astype(bool)
 
-    # Upsample back to original image size
     mask_big_bool = _upsample_mask_bool(mask_small, (H, W))
     return (mask_big_bool.astype(np.uint8)) * 255
 
@@ -249,37 +257,30 @@ def inpaint_on_roi(img: np.ndarray, full_mask: np.ndarray, method: str = "lama",
     out[y0:y1, x0:x1] = cleaned
     return out
 
-# ========= Main processing =========
 def process_image(path_in: str, path_out: str, slno: int):
     img = cv2.imread(path_in)
     if img is None:
         print("Skip (unreadable):", path_in); return
 
-    # YOLO inference (same as before)
     with torch.inference_mode():
         res = yolo(img, conf=CONF, iou=0.4, imgsz=IMGSZ, augment=False, verbose=False, device=DEVICE)
     boxes = res[0].boxes.xyxy.detach().to("cpu").numpy()
 
     if boxes.shape[0] == 0:
         print(slno, "- No detection:", os.path.basename(path_in))
-        shutil.copy2(path_in, path_out)   # <-- RETURN ORIGINAL
+        shutil.copy2(path_in, path_out)
         return
 
     h, w = img.shape[:2]
     masks_for_all = []
 
-    # ======== NEW: prepare SAM once per image on a downscaled copy ========
-    sam_scale, orig_hw = sam_prepare_image_once(img)  # caches embeddings on small image
+    sam_scale, orig_hw = sam_prepare_image_once(img)
 
-    # Generate masks only (no inpaint yet)
     for i, (x1, y1, x2, y2) in enumerate(boxes):
         xi1, yi1, xi2, yi2 = map(int, [x1, y1, x2, y2])
         box_m = yolo_box_mask(h, w, xi1, yi1, xi2, yi2, pad=2)
 
-        # ======== NEW: predict SAM mask using scaled box → upsample to original ========
         sam_m = sam_mask_from_box_scaled([x1, y1, x2, y2], sam_scale, orig_hw)
-
-        # Keep existing logic: intersect with YOLO box & fallback to box if tiny
         sam_m = cv2.bitwise_and(sam_m, box_m)
 
         if SAVE_DEBUG_MASKS:
@@ -289,11 +290,10 @@ def process_image(path_in: str, path_out: str, slno: int):
 
         masks_for_all.append(sam_m if int(np.count_nonzero(sam_m)) >= 50 else box_m)
 
-    # Combine masks and inpaint ONCE on cropped ROI
     full_mask = combine_masks(masks_for_all, h, w)
     if int(np.count_nonzero(full_mask)) == 0:
         print("Masks empty after combine:", os.path.basename(path_in))
-        _copy_to_notfound(path_in)  # <--- NEW
+        _copy_to_notfound(path_in)
         return
 
     img = inpaint_on_roi(img, full_mask, method=INPAINT_METHOD)
@@ -301,30 +301,6 @@ def process_image(path_in: str, path_out: str, slno: int):
     try:
         cv2.imwrite(path_out, img, [int(cv2.IMWRITE_WEBP_QUALITY), 80])
     except Exception:
-        # fallback if not writing as webp
         cv2.imwrite(path_out, img)
+
     print(f"{slno} - Cleaned fast ({INPAINT_METHOD.upper()}+ROI+SAM@{SAM_MAX_SIDE}): {os.path.basename(path_in)}")
-
-
-def main():
-    if len(sys.argv) > 1:
-        fn = sys.argv[1]
-        out = os.path.join(OUTPUT_DIR, os.path.basename(fn))
-        process_image(fn, out, slno=1)
-    else:
-        slno = 1
-        for fn in os.listdir(INPUT_DIR):
-            if fn.lower().endswith(".webp"):
-                in_path = os.path.join(INPUT_DIR, fn)
-                out_path = os.path.join(OUTPUT_DIR, fn)
-
-                # ✅ Skip if already processed
-                if os.path.exists(out_path):
-                    print(f"Skipping (already processed): {fn}")
-                    continue
-
-                process_image(in_path, out_path, slno)
-                slno += 1
-
-if __name__ == "__main__":
-    main()
