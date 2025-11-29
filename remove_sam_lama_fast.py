@@ -304,3 +304,82 @@ def process_image(path_in: str, path_out: str, slno: int):
         cv2.imwrite(path_out, img)
 
     print(f"{slno} - Cleaned fast ({INPAINT_METHOD.upper()}+ROI+SAM@{SAM_MAX_SIDE}): {os.path.basename(path_in)}")
+
+def process_image_full(path_in: str, path_out: str, slno: int):
+    """
+    Variant 2: Full-image inpaint instead of ROI-only.
+    Uses the same YOLO+SAM pipeline, but passes the combined mask
+    for the entire image directly to the inpaint method.
+    """
+    img = cv2.imread(path_in)
+    if img is None:
+        print("Skip (unreadable):", path_in)
+        return
+
+    # YOLO inference (same as in process_image)
+    with torch.inference_mode():
+        res = yolo(
+            img,
+            conf=CONF,
+            iou=0.4,
+            imgsz=IMGSZ,
+            augment=False,
+            verbose=False,
+            device=DEVICE,
+        )
+    boxes = res[0].boxes.xyxy.detach().to("cpu").numpy()
+
+    if boxes.shape[0] == 0:
+        # No detection → return original image unchanged
+        print(slno, "- No detection (full):", os.path.basename(path_in))
+        shutil.copy2(path_in, path_out)
+        return
+
+    h, w = img.shape[:2]
+    masks_for_all = []
+
+    # Prepare SAM once
+    sam_scale, orig_hw = sam_prepare_image_once(img)
+
+    # Build per-box masks
+    for i, (x1, y1, x2, y2) in enumerate(boxes):
+        xi1, yi1, xi2, yi2 = map(int, [x1, y1, x2, y2])
+        box_m = yolo_box_mask(h, w, xi1, yi1, xi2, yi2, pad=2)
+
+        sam_m = sam_mask_from_box_scaled([x1, y1, x2, y2], sam_scale, orig_hw)
+        sam_m = cv2.bitwise_and(sam_m, box_m)
+
+        if SAVE_DEBUG_MASKS:
+            overlay = img.copy()
+            overlay[sam_m > 0] = (
+                0.6 * overlay[sam_m > 0] + 0.4 * np.array([0, 0, 255])
+            ).astype(np.uint8)
+            cv2.imwrite(
+                os.path.join(
+                    DEBUG_DIR,
+                    f"{os.path.basename(path_in)}_full_mask{i}.png",
+                ),
+                overlay,
+            )
+
+        masks_for_all.append(sam_m if int(np.count_nonzero(sam_m)) >= 50 else box_m)
+
+    # Combine all masks
+    full_mask = combine_masks(masks_for_all, h, w)
+    if int(np.count_nonzero(full_mask)) == 0:
+        print("Masks empty after combine (full):", os.path.basename(path_in))
+        shutil.copy2(path_in, path_out)
+        return
+
+    # 🔥 Variant 2: FULL IMAGE INPAINT (no ROI crop)
+    img_clean = smart_inpaint(img, full_mask, method=INPAINT_METHOD)
+
+    try:
+        cv2.imwrite(path_out, img_clean, [int(cv2.IMWRITE_WEBP_QUALITY), 80])
+    except Exception:
+        cv2.imwrite(path_out, img_clean)
+
+    print(
+        f"{slno} - Cleaned FULL ({INPAINT_METHOD.upper()}+SAM@{SAM_MAX_SIDE}): "
+        f"{os.path.basename(path_in)}"
+    )
